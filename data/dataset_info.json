@@ -714,5 +714,14 @@
       "prompt": "content"
     },
     "folder": "python"
-  }
+  },
+  "diffusion_omnisvg": {
+    "file_name": "../my_data/omnisvg_first_10_entries.json",
+    "columns": {
+      "prompt": "instruction",
+      "query": "input",
+      "response": "output"
+    }
+}
+
 }

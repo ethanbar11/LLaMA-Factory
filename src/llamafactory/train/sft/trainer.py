@@ -30,6 +30,7 @@ from ...extras.constants import IGNORE_INDEX
 from ...extras.packages import is_transformers_version_greater_than
 from ..callbacks import SaveProcessorCallback
 from ..trainer_utils import create_custom_optimizer, create_custom_scheduler
+import torch.nn.functional as F
 
 
 if TYPE_CHECKING:
@@ -103,9 +104,88 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
         return super()._get_train_sampler(*args, **kwargs)
 
+    def transition(self, x_0, sigma, maskable_mask):
+        # move_chance = 1 - (-sigma).exp()
+        move_chance = sigma
+        move_indices = (torch.rand(*x_0.shape, device=x_0.device) < move_chance) & maskable_mask
+        x_t = torch.where(move_indices, self.processing_class.mask_token_id, x_0)
+        return x_t
+        
+    def diffusion_forward(self, model, x, src_mask, sampling_eps=1e-3):
+        batch_size = x.shape[0]
+        if src_mask is None:
+            src_mask = torch.zeros_like(x, device=x.device, dtype=torch.bool)
+        
+        # Sample noise level
+        t = (1 - sampling_eps) * torch.rand(x.shape[0], device=x.device) + sampling_eps
+        
+        # Compute sigma and dsigma
+        sigma = t
+        dsigma = torch.reciprocal(t)
+        
+        # Apply noise to input
+        x_t = self.transition(x, sigma[:, None], maskable_mask=~src_mask)
+        
+        # Forward pass
+        logits = model(input_ids=x_t, attention_mask=None).logits
+        
+        # Apply mask for loss computation
+        loss_mask = x_t == self.processing_class.mask_token_id
+        
+        # Shift loss
+        logits = logits[:, :-1]
+        loss_mask = loss_mask[:, 1:]
+        x_target = x[:, 1:]
+        
+        # Compute loss
+        loss = F.cross_entropy(
+            logits.reshape(-1, logits.shape[-1]), 
+            x_target.reshape(-1), 
+            reduction="none"
+        ).float().reshape(batch_size, -1)
+        
+        loss = loss.masked_fill(~loss_mask, 0)
+        final_loss = (dsigma[:, None] * loss).sum() / loss_mask.sum()
+        unweighted_loss = loss.sum() / loss_mask.sum()
+        
+        return final_loss, unweighted_loss, x_t
+
+    def _get_dynamic_ratio(self) -> float:
+        """Calculate the dynamic ratio based on training progress.
+        At the start (0% progress), ratio is near 0.
+        At 2/3 of training, ratio becomes 1.
+        """
+        if not hasattr(self.state, 'global_step') or not hasattr(self.state, 'max_steps'):
+            logger.warning("State not initialized, using default ratio")
+            return 0.9  # fallback to default if state not initialized
+        
+        progress = self.state.global_step / self.state.max_steps
+        if progress < 1/5:
+            # Linear increase from 0 to 1 during first 1/5 of training
+            return progress * 5  # multiply by 5 to reach 1 at 1/5 progress
+        else:
+            return 1.0
+
     @override
     def compute_loss(self, model, inputs, *args, **kwargs):
-        return super().compute_loss(model, inputs, *args, **kwargs)
+        # if torch.rand(1) < self._get_dynamic_ratio():
+        #     src_mask = inputs["labels"] == IGNORE_INDEX
+        # else:
+        #     src_mask = None
+
+        # # src_mask = None
+
+        src_mask = inputs["labels"] == IGNORE_INDEX
+
+        # Apply diffusion forward
+        final_loss, unweighted_loss, x_t = self.diffusion_forward(
+            model, 
+            inputs["input_ids"], 
+            src_mask
+        )
+        # wandb.log({"loss": final_loss.item(), "unweighted_loss": unweighted_loss.item()})
+        
+        return final_loss
 
     @override
     def prediction_step(
@@ -124,15 +204,13 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             labels = inputs.pop("labels", None)
         else:
             labels = inputs.get("labels")
+            
+        # Create source mask where label is IGNORE_INDEX
+        src_mask = labels == IGNORE_INDEX if labels is not None else None
+        loss, _, x_t = self.diffusion_forward(model, inputs["input_ids"], src_mask)
 
-        loss, generated_tokens, _ = super().prediction_step(
-            model, inputs, prediction_loss_only=prediction_loss_only, ignore_keys=ignore_keys, **gen_kwargs
-        )
-        if generated_tokens is not None and self.args.predict_with_generate:
-            generated_tokens[:, : inputs["input_ids"].size(-1)] = self.processing_class.pad_token_id
-            generated_tokens = generated_tokens.contiguous()
+        return loss, _, _
 
-        return loss, generated_tokens, labels
 
     def save_predictions(
         self, dataset: "Dataset", predict_results: "PredictionOutput", skip_special_tokens: bool = True

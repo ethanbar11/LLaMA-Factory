@@ -18,7 +18,7 @@ lora_dropout: 0 #0.1
 
 
 ### dataset
-dataset: omnisvg_generation_less_than_256_tokens_train_only
+dataset: diffusion_omnisvg
 template: qwen
 cutoff_len: 256
 overwrite_cache: true
